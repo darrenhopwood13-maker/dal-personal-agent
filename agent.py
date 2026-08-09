@@ -1,6 +1,14 @@
 import os
 import time
+import ast
+import html
+import math
+import operator
+import re
 from collections import defaultdict, deque
+from datetime import datetime
+from urllib.parse import quote
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import requests
 from openai import OpenAI
@@ -54,7 +62,9 @@ You will eventually have tools for:
 - coding and development
 - file analysis
 
-For now, you only have conversation access.
+For now, you can chat, summarise text, calculate, tell the time, and do a
+limited Wikipedia lookup with the /research command. You do not have broad
+live web search, browser access, or access to Dal's private services.
 
 Never claim that you have accessed a service or completed an action
 unless you actually have a tool that allows you to do it.
@@ -64,6 +74,27 @@ Keep normal replies reasonably concise unless Dal asks for detail.
 
 
 history = defaultdict(lambda: deque(maxlen=20))
+
+HELP_TEXT = """I can chat normally, or you can use:
+
+/calc 17.5% of 84600 is written as: 84600 * 17.5 / 100
+/time Europe/London
+/summarise <paste text here>
+/research <topic>  (quick Wikipedia lookup)
+
+For anything else, just message me normally."""
+
+CALCULATION_OPERATORS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.FloorDiv: operator.floordiv,
+    ast.Mod: operator.mod,
+    ast.Pow: operator.pow,
+    ast.USub: operator.neg,
+    ast.UAdd: operator.pos,
+}
 
 
 def telegram_request(method, **kwargs):
@@ -96,14 +127,15 @@ def send_message(chat_id, text):
         )
 
 
-def ask_ai(chat_id, message):
+def ask_ai(chat_id, message, remember=True):
 
-    history[chat_id].append(
-        {
-            "role": "user",
-            "content": message,
-        }
-    )
+    if remember:
+        history[chat_id].append(
+            {
+                "role": "user",
+                "content": message,
+            }
+        )
 
     messages = [
         {
@@ -112,7 +144,10 @@ def ask_ai(chat_id, message):
         }
     ]
 
-    messages.extend(history[chat_id])
+    if remember:
+        messages.extend(history[chat_id])
+    else:
+        messages.append({"role": "user", "content": message})
 
     response = client.chat.completions.create(
         model=MODEL,
@@ -125,14 +160,143 @@ def ask_ai(chat_id, message):
     if not reply:
         reply = "I didn't get a usable response."
 
-    history[chat_id].append(
-        {
-            "role": "assistant",
-            "content": reply,
-        }
-    )
+    if remember:
+        history[chat_id].append(
+            {
+                "role": "assistant",
+                "content": reply,
+            }
+        )
 
     return reply
+
+
+def safe_calculate(expression):
+    """Evaluate a small, numeric-only arithmetic expression."""
+    if len(expression) > 200:
+        raise ValueError("That calculation is too long.")
+
+    tree = ast.parse(expression, mode="eval")
+
+    def evaluate(node):
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+            return node.value
+
+        if isinstance(node, ast.UnaryOp) and type(node.op) in CALCULATION_OPERATORS:
+            return CALCULATION_OPERATORS[type(node.op)](evaluate(node.operand))
+
+        if isinstance(node, ast.BinOp) and type(node.op) in CALCULATION_OPERATORS:
+            left = evaluate(node.left)
+            right = evaluate(node.right)
+
+            if isinstance(node.op, ast.Pow) and abs(right) > 100:
+                raise ValueError("That exponent is too large.")
+
+            return CALCULATION_OPERATORS[type(node.op)](left, right)
+
+        raise ValueError("Use numbers and +, -, *, /, //, %, **, and brackets only.")
+
+    result = evaluate(tree.body)
+
+    if not isinstance(result, (int, float)) or not math.isfinite(result):
+        raise ValueError("That calculation does not have a finite result.")
+
+    return result
+
+
+def format_calculation(expression):
+    try:
+        result = safe_calculate(expression)
+    except (ArithmeticError, SyntaxError, ValueError) as exc:
+        return f"I couldn't calculate that: {exc}"
+
+    return f"{expression} = {result:g}"
+
+
+def get_time(timezone_name):
+    timezone_name = timezone_name or "Europe/London"
+
+    try:
+        now = datetime.now(ZoneInfo(timezone_name))
+    except ZoneInfoNotFoundError:
+        return (
+            f"I don't recognise `{timezone_name}`. Try an IANA name such as "
+            "Europe/London or America/New_York."
+        )
+
+    return now.strftime(f"%A, %d %B %Y — %H:%M %Z ({timezone_name})")
+
+
+def research_wikipedia(query):
+    if not query:
+        return "Tell me what to look up, for example: /research Ada Lovelace"
+
+    response = requests.get(
+        "https://en.wikipedia.org/w/api.php",
+        params={
+            "action": "query",
+            "list": "search",
+            "srsearch": query,
+            "srlimit": 3,
+            "format": "json",
+            "utf8": 1,
+        },
+        headers={"User-Agent": "dal-personal-agent/1.0"},
+        timeout=10,
+    )
+    response.raise_for_status()
+
+    results = response.json().get("query", {}).get("search", [])
+    if not results:
+        return f"I couldn't find a Wikipedia result for '{query}'."
+
+    lines = ["Quick research (Wikipedia):"]
+    for result in results:
+        title = result["title"]
+        snippet = re.sub(r"\s+", " ", html.unescape(re.sub(r"<.*?>", "", result.get("snippet", "")))).strip()
+        url = f"https://en.wikipedia.org/wiki/{quote(title.replace(' ', '_'))}"
+        lines.append(f"• {title}: {snippet}\n{url}")
+
+    return "\n\n".join(lines)
+
+
+def handle_command(chat_id, text):
+    command, _, argument = text.partition(" ")
+    command = command.split("@", 1)[0].lower()
+    argument = argument.strip()
+
+    if command in {"/start", "/help"}:
+        return HELP_TEXT
+    if command == "/calc":
+        return format_calculation(argument) if argument else "Try: /calc 84600 * 17.5 / 100"
+    if command == "/time":
+        return get_time(argument)
+    if command in {"/summarise", "/summarize"}:
+        if not argument:
+            return "Paste the text after /summarise and I'll make it concise."
+        return ask_ai(
+            chat_id,
+            "Summarise the text below in concise bullet points. Preserve important "
+            "facts, numbers, dates, decisions, and action items. Do not add facts.\n\n"
+            f"TEXT:\n{argument}",
+            remember=False,
+        )
+    if command == "/research":
+        try:
+            return research_wikipedia(argument)
+        except requests.RequestException:
+            return "The quick research lookup is unavailable right now. Please try again shortly."
+
+    return None
+
+
+def respond_to_message(chat_id, text):
+    if text.startswith("/"):
+        command_reply = handle_command(chat_id, text)
+        if command_reply is not None:
+            return command_reply
+
+    return ask_ai(chat_id, text)
 
 
 def main():
@@ -181,7 +345,7 @@ def main():
 
                 try:
 
-                    reply = ask_ai(chat_id, text)
+                    reply = respond_to_message(chat_id, text)
 
                     send_message(
                         chat_id,
