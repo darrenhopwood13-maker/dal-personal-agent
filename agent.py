@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 import requests
 from openai import OpenAI
 
+from skills import skill_names, skills_index
 from tools import (
     TOOL_SCHEMAS,
     elevenlabs_speech_to_text,
@@ -129,7 +130,33 @@ HONESTY
 - If a tool fails or a key is missing, name it and say what's wrong.
 - "I don't know" is a complete answer. Then go and find out.
 - If you're guessing, say so.
-"""
+- Keep four things apart when you answer: what you know, what a tool told you,
+  what you're assuming, and what you're recommending. Blurring them is how bad
+  decisions get made.
+
+SKILLS
+You have specialist briefs. Each one sets out how Dal wants a particular kind
+of work done. Load the brief with load_skill BEFORE you start that work, not
+after. Available:
+
+{skills}
+
+Don't announce that you're loading one. Just do the work properly.
+""".format(skills=skills_index())
+
+
+HELP_TEXT = """I'm Brooksy. Talk to me normally - I'll search, calculate, read
+pages and look things up on my own. No commands needed for any of that.
+
+The ones that do exist:
+
+/status   what's connected and what's missing
+/skills   the specialist briefs I can pull
+/voice on | off   send audio replies alongside text
+/voices   list the ElevenLabs voices on your account
+/say <text>   speak something back to you
+/forget   wipe this conversation's history
+/whoami   your Telegram chat id"""
 
 
 # ---------------------------------------------------------------------------
@@ -415,6 +442,19 @@ def handle_command(chat_id, text):
     if command == "/status":
         return tool_status()
 
+    if command == "/skills":
+        if argument:
+            return run_tool("load_skill", json.dumps({"name": argument}))
+        names = skill_names()
+        if not names:
+            return "No skill briefs installed."
+        return (
+            "Specialist briefs I can load:\n\n"
+            + skills_index()
+            + "\n\nI pull these automatically when the work calls for it. "
+            "Use /skills <name> to read one."
+        )
+
     if command == "/forget":
         clear_history(chat_id)
         return "History wiped. Fresh start."
@@ -519,6 +559,7 @@ def main():
 
     print(f"Brooksy starting with {MODEL}")
     print(f"Tools loaded: {len(TOOL_SCHEMAS)}")
+    print(f"Skills loaded: {len(skill_names())} ({', '.join(skill_names()) or 'none'})")
 
     if ALLOWED_CHAT_IDS:
         print(f"Restricted to chat ids: {sorted(ALLOWED_CHAT_IDS)}")

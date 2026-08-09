@@ -22,6 +22,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import requests
 
+from skills import skill_names, tool_load_skill
+
 
 BRAVE_SEARCH_API_KEY = os.getenv("BRAVE_SEARCH_API_KEY")
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
@@ -882,6 +884,29 @@ TOOL_SCHEMAS = [
             "parameters": {"type": "object", "properties": {}},
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "load_skill",
+            "description": (
+                "Load a specialist brief before doing that kind of work. Call this "
+                "FIRST, before answering, whenever the job matches one of the "
+                "available skills. The brief tells you how Dal wants that work done."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": (
+                            "Skill name. Available: " + ", ".join(skill_names())
+                        ),
+                    }
+                },
+                "required": ["name"],
+            },
+        },
+    },
 ]
 
 
@@ -899,6 +924,7 @@ TOOL_FUNCTIONS = {
     "supabase_query": tool_supabase_query,
     "supabase_count": tool_supabase_count,
     "list_voices": tool_list_voices,
+    "load_skill": tool_load_skill,
 }
 
 
