@@ -45,7 +45,7 @@ TELEGRAM_FILE_API = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}"
 DATABASE_PATH = os.getenv("DATABASE_PATH", "/data/agent.db")
 
 HISTORY_TURNS = int(os.getenv("HISTORY_TURNS", "30"))
-MAX_TOOL_ROUNDS = int(os.getenv("MAX_TOOL_ROUNDS", "6"))
+MAX_TOOL_ROUNDS = int(os.getenv("MAX_TOOL_ROUNDS", "14"))
 
 # Comma separated Telegram chat ids, e.g. "123456789,987654321"
 _allowed_raw = (os.getenv("ALLOWED_CHAT_IDS") or "").strip()
@@ -389,15 +389,42 @@ def ask_ai(chat_id, user_message, remember=True):
                 }
             )
 
-    fallback = (
-        "I used several tools but couldn't settle on an answer. "
-        "Try narrowing the question."
-    )
+    # Out of tool rounds. Don't bin the work: make one last call with tools
+    # switched off, so the model answers from what it has already gathered
+    # instead of throwing away a job that was most of the way done.
+    try:
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=messages
+            + [
+                {
+                    "role": "user",
+                    "content": (
+                        "You have used your full tool budget. Answer now, in "
+                        "full, using only what you have already gathered. "
+                        "Follow the output format the skill brief asked for. "
+                        "Where you could not check something, say so plainly "
+                        "rather than guessing at it."
+                    ),
+                }
+            ],
+            temperature=0.75,
+        )
+        reply = (response.choices[0].message.content or "").strip()
+    except Exception as exc:  # noqa: BLE001 - never lose the whole answer
+        print(f"Final-answer call failed: {exc}")
+        reply = ""
+
+    if not reply:
+        reply = (
+            "I gathered the material but ran out of tool calls before I could "
+            "write it up. Ask me for one section at a time and I'll get through it."
+        )
 
     if remember:
-        save_message(chat_id, "assistant", fallback)
+        save_message(chat_id, "assistant", reply)
 
-    return fallback
+    return reply
 
 
 # ---------------------------------------------------------------------------
