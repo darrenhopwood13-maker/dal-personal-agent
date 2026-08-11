@@ -60,9 +60,17 @@ to this bit.
 
 
 def _client():
+    """OpenAI by default. Set OPENAI_BASE_URL to point it somewhere else,
+    for instance the DeepSeek key the agent already uses."""
+
     key = os.getenv("OPENAI_API_KEY")
     if not key:
         raise RuntimeError("OPENAI_API_KEY is not set")
+
+    base_url = os.getenv("OPENAI_BASE_URL")
+    if base_url:
+        return OpenAI(api_key=key, base_url=base_url)
+
     return OpenAI(api_key=key)
 
 
