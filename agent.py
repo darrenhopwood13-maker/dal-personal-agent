@@ -46,6 +46,7 @@ DATABASE_PATH = os.getenv("DATABASE_PATH", "/data/agent.db")
 
 HISTORY_TURNS = int(os.getenv("HISTORY_TURNS", "30"))
 MAX_TOOL_ROUNDS = int(os.getenv("MAX_TOOL_ROUNDS", "14"))
+MAX_FACTS = int(os.getenv("MAX_FACTS", "100"))
 
 # Comma separated Telegram chat ids, e.g. "123456789,987654321"
 _allowed_raw = (os.getenv("ALLOWED_CHAT_IDS") or "").strip()
@@ -155,7 +156,10 @@ The ones that do exist:
 /voice on | off   send audio replies alongside text
 /voices   list the ElevenLabs voices on your account
 /say <text>   speak something back to you
-/forget   wipe this conversation's history
+/forget   wipe this conversation's history (stored facts survive)
+/remember <fact>   store something about you for good
+/facts   list everything I'm holding on to
+/forgetfact <id>   drop one stored fact
 /whoami   your Telegram chat id"""
 
 
@@ -211,6 +215,19 @@ def init_database():
             )
             """
         )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS facts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                fact TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS facts_chat_idx ON facts (chat_id, id)"
+        )
 
     connection.close()
     print(f"History database ready at {DATABASE_PATH}")
@@ -264,6 +281,55 @@ def set_voice_setting(chat_id, enabled):
             (chat_id, 1 if enabled else 0),
         )
     connection.close()
+
+
+def remember_fact(chat_id, fact):
+    """Store one permanent fact for this chat. Returns the stored text."""
+
+    fact = (fact or "").strip()
+    if not fact:
+        return None
+
+    connection = _connect()
+    with connection:
+        connection.execute(
+            "INSERT INTO facts (chat_id, fact, created_at) VALUES (?, ?, ?)",
+            (chat_id, fact, datetime.now(timezone.utc).isoformat()),
+        )
+        # Cap the store so the system prompt can't bloat: oldest facts drop off.
+        connection.execute(
+            "DELETE FROM facts WHERE chat_id = ? AND id NOT IN ("
+            "SELECT id FROM facts WHERE chat_id = ? ORDER BY id DESC LIMIT ?"
+            ")",
+            (chat_id, chat_id, MAX_FACTS),
+        )
+    connection.close()
+
+    return fact
+
+
+def list_facts(chat_id):
+    connection = _connect()
+    rows = connection.execute(
+        "SELECT id, chat_id, fact, created_at FROM facts WHERE chat_id = ? "
+        "ORDER BY id",
+        (chat_id,),
+    ).fetchall()
+    connection.close()
+
+    return rows
+
+
+def forget_fact(chat_id, fact_id):
+    connection = _connect()
+    with connection:
+        deleted = connection.execute(
+            "DELETE FROM facts WHERE chat_id = ? AND id = ?",
+            (chat_id, fact_id),
+        ).rowcount
+    connection.close()
+
+    return deleted > 0
 
 
 # ---------------------------------------------------------------------------
@@ -326,7 +392,18 @@ def download_telegram_file(file_id):
 def ask_ai(chat_id, user_message, remember=True):
     """Run the model with tool calling until it produces a final answer."""
 
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    prompt = SYSTEM_PROMPT
+    facts = list_facts(chat_id)
+
+    if facts:
+        lines = "\n".join(f"- {row[2]}" for row in facts)
+        prompt += (
+            "\n\nFACTS YOU REMEMBER ABOUT DAL (from /remember, permanent):\n"
+            f"{lines}\n"
+            "Treat these as true until told otherwise."
+        )
+
+    messages = [{"role": "system", "content": prompt}]
 
     if remember:
         messages.extend(load_history(chat_id))
@@ -484,7 +561,31 @@ def handle_command(chat_id, text):
 
     if command == "/forget":
         clear_history(chat_id)
-        return "History wiped. Fresh start."
+        return "History wiped. Fresh start. Anything from /remember is untouched."
+
+    if command == "/remember":
+        fact = remember_fact(chat_id, argument)
+        if not fact:
+            return "Give me something to remember, e.g. /remember I take my tea black"
+        return f"Remembered: {fact}"
+
+    if command == "/facts":
+        facts = list_facts(chat_id)
+        if not facts:
+            return "Nothing stored yet."
+        lines = [f"{row[0]}. {row[2]}" for row in facts]
+        return (
+            "What I remember:\n\n"
+            + "\n".join(lines)
+            + "\n\nUse /forgetfact <id> to drop one."
+        )
+
+    if command == "/forgetfact":
+        if not argument.isdigit():
+            return "Give me the id from /facts, e.g. /forgetfact 3"
+        if forget_fact(chat_id, int(argument)):
+            return f"Forgotten fact {argument}."
+        return f"There's no fact {argument} in this chat."
 
     if command == "/voice":
         if argument.lower() in {"on", "yes", "1"}:
