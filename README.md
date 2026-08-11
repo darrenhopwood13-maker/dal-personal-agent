@@ -10,7 +10,7 @@ itself when to search the web, read a page, do a calculation or look at a
 GitHub repo. You no longer type `/search` — just ask.
 
 Also added: voice notes in and out via ElevenLabs, history that survives a
-redeploy, and access control.
+redeploy, facts it holds on to permanently, and access control.
 
 ## Tools
 
@@ -35,7 +35,10 @@ Only for things the model shouldn't decide:
 - `/voice on` / `/voice off` — spoken replies alongside text
 - `/say <text>` — speak something back
 - `/voices` — list ElevenLabs voices and their ids
-- `/forget` — wipe conversation history
+- `/forget` — wipe conversation history; stored facts survive
+- `/remember <fact>` — store something about you permanently
+- `/facts` — list what's stored, with ids
+- `/forgetfact <id>` — drop one stored fact
 - `/status` — show which keys are wired up
 - `/whoami` — show your Telegram chat id
 
@@ -66,6 +69,7 @@ Set these in Railway. Never commit their values.
 - `DEEPSEEK_MODEL` — defaults to `deepseek-v4-flash`
 - `DATABASE_PATH` — defaults to `/data/agent.db`
 - `HISTORY_TURNS` — conversation turns to remember, defaults to 30
+- `MAX_FACTS` — permanent facts kept per chat, defaults to 100
 
 ## History persistence
 
@@ -73,6 +77,18 @@ History is stored in SQLite at `DATABASE_PATH`. Railway containers are
 ephemeral, so **attach a Railway volume mounted at `/data`** or the history
 will still be wiped on redeploy. If the path isn't writable, the agent falls
 back to `./agent.db` and logs a warning.
+
+## Long-term memory
+
+`/forget` clears the conversation but not what you've told the agent to keep.
+Facts saved with `/remember` live in a separate `facts` table, per chat, and
+get injected into the system prompt on every reply, so they survive both a
+wiped history and a redeploy. The store is capped at `MAX_FACTS` per chat and
+the oldest fact drops off silently once you're over, which stops the prompt
+growing without limit. Same volume caveat as history: no volume, no memory.
+
+Use `/facts` to see what's held and the id of each one, then `/forgetfact <id>`
+to drop a single fact.
 
 ## Running it
 
