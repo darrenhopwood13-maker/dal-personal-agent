@@ -1,361 +1,435 @@
 """
-writes.py — confirmation queue and audit log for Brooksy's write tools.
+tools_write.py — Brooksy's write tools.
 
-Nothing that changes the outside world executes on the model's say-so. A write tool
-call is intercepted, staged, and summarised back to Dal. It only runs after an
-explicit /confirm.
+Every function here is registered as a write tool, which means it cannot execute
+directly from a model tool call. writes.intercept() stages it and Dal confirms it.
 
-Wiring (three touch points in your bot — see WRITE_ACCESS_SETUP.md):
-  1. call writes.init_db() at startup
-  2. in your tool dispatcher, call writes.intercept() before executing a tool
-  3. add /confirm, /cancel and /pending command handlers
+Design rules baked in, not left to the model:
+  * repo allowlist, and default branches are hard-refused
+  * table allowlist, and there is no delete path at all
+  * updates target one row by primary key
+  * no schema changes, no deploys, no credential handling
 
-Stdlib only. Stores in the same Railway volume as your chat history.
+Requires: requests. Swap to httpx if that's what the repo already uses.
 """
 
+import base64
 import json
 import os
-import secrets
-import sqlite3
-import time
+import requests
 
-DATA_DIR = os.getenv("PODCAST_DATA_DIR") or os.getenv("DATA_DIR") or "/data"
-DB_PATH = os.path.join(DATA_DIR, "writes.db")
+from writes import register_write_tool
 
-# How long a staged write stays confirmable
-TTL_SECONDS = int(os.getenv("WRITE_TTL_SECONDS", "900"))  # 15 minutes
+TIMEOUT = 30
 
-# Global kill switch. DRY_RUN=1 means confirmed writes are logged, never executed.
-DRY_RUN = os.getenv("WRITE_DRY_RUN", "0") == "1"
+# ----------------------------------------------------------------- configuration
 
-# Tighter than ALLOWED_CHAT_IDS on purpose: reading is one trust level, writing another.
-_raw_write_ids = os.getenv("ALLOWED_WRITE_CHAT_IDS", "").strip()
-ALLOWED_WRITE_CHAT_IDS = set()
-for _entry in _raw_write_ids.replace(" ", "").split(","):
-    if not _entry:
-        continue
-    try:
-        ALLOWED_WRITE_CHAT_IDS.add(int(_entry))
-    except ValueError:
-        print(f"writes: ignoring malformed ALLOWED_WRITE_CHAT_IDS entry {_entry!r}")
+GITHUB_TOKEN = os.getenv("GITHUB_WRITE_TOKEN") or os.getenv("GITHUB_TOKEN", "")
+GITHUB_API = "https://api.github.com"
 
-# Populated by tools_write.py at import time.
-WRITE_TOOLS = set()
+# Only these repos can be written to. Comma-separated owner/name.
+GITHUB_WRITE_ALLOWLIST = {
+    r.strip()
+    for r in os.getenv("GITHUB_WRITE_ALLOWLIST", "").split(",")
+    if r.strip()
+}
 
+PROTECTED_BRANCHES = {"main", "master", "production", "prod", "live", "release"}
 
-def register_write_tool(name):
-    """Mark a tool as requiring confirmation before it executes."""
-    WRITE_TOOLS.add(name)
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
+SUPABASE_WRITE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
 
+# Only these tables can be written to. Comma-separated.
+SUPABASE_WRITE_TABLES = {
+    t.strip()
+    for t in os.getenv("SUPABASE_WRITE_TABLES", "").split(",")
+    if t.strip()
+}
 
-def is_write_tool(name):
-    return name in WRITE_TOOLS
+# Tables that must never be written to even if someone adds them to the allowlist.
+SUPABASE_FORBIDDEN_TABLES = {"audit_log", "auth.users", "users", "write_audit"}
 
-
-# ----------------------------------------------------------------------------- db
+class WriteRefused(Exception):
+    """A guard said no. Not a transport failure — don't retry."""
 
 
-def _conn():
-    os.makedirs(DATA_DIR, exist_ok=True)
-    c = sqlite3.connect(DB_PATH)
-    c.row_factory = sqlite3.Row
-    return c
+def _gh_headers():
+    if not GITHUB_TOKEN:
+        raise WriteRefused("GITHUB_WRITE_TOKEN is not set.")
+    return {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
 
 
-def init_db():
-    with _conn() as c:
-        c.execute(
-            """CREATE TABLE IF NOT EXISTS pending_writes (
-                token      TEXT PRIMARY KEY,
-                chat_id    INTEGER NOT NULL,
-                tool_name  TEXT NOT NULL,
-                args_json  TEXT NOT NULL,
-                summary    TEXT NOT NULL,
-                created_at REAL NOT NULL,
-                expires_at REAL NOT NULL,
-                status     TEXT NOT NULL DEFAULT 'pending'
-            )"""
-        )
-        c.execute(
-            """CREATE TABLE IF NOT EXISTS write_audit (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                chat_id    INTEGER,
-                tool_name  TEXT NOT NULL,
-                args_json  TEXT NOT NULL,
-                outcome    TEXT NOT NULL,
-                detail     TEXT,
-                created_at REAL NOT NULL
-            )"""
-        )
-        c.execute(
-            "CREATE INDEX IF NOT EXISTS idx_pending_chat ON pending_writes(chat_id, status)"
+def _check_repo(repo):
+    if "/" not in repo:
+        raise WriteRefused(f"Repo must be owner/name, got '{repo}'.")
+    if not GITHUB_WRITE_ALLOWLIST:
+        raise WriteRefused("GITHUB_WRITE_ALLOWLIST is empty — no repo is writable.")
+    if repo not in GITHUB_WRITE_ALLOWLIST:
+        raise WriteRefused(
+            f"'{repo}' is not on the write allowlist. Ask Dal to add it, don't route around it."
         )
 
 
-# -------------------------------------------------------------------------- audit
+def _check_branch(branch):
+    if not branch:
+        raise WriteRefused("A branch must be named explicitly.")
+    if branch.lower() in PROTECTED_BRANCHES:
+        raise WriteRefused(
+            f"'{branch}' is protected. Write to a brooksy/* branch and open a PR."
+        )
 
 
-# Self-initialising: one less thing to remember in agent.py, and one less way for
-# a missing startup call to take down every write.
-init_db()
+# --------------------------------------------------------------------- github
 
 
-def log_write(
-    chat_id,
-    tool_name,
-    args,
-    outcome,
-    detail: str = "",
+def tool_github_create_branch(
+    repo, new_branch, from_branch = "main"
 ):
-    """outcome: staged | confirmed | cancelled | expired | executed | failed | blocked"""
-    with _conn() as c:
-        c.execute(
-            "INSERT INTO write_audit (chat_id, tool_name, args_json, outcome, detail, created_at)"
-            " VALUES (?,?,?,?,?,?)",
-            (chat_id, tool_name, _safe_json(args), outcome, detail[:2000], time.time()),
+    _check_repo(repo)
+    _check_branch(new_branch)
+
+    r = requests.get(
+        f"{GITHUB_API}/repos/{repo}/git/ref/heads/{from_branch}",
+        headers=_gh_headers(),
+        timeout=TIMEOUT,
+    )
+    if r.status_code != 200:
+        raise WriteRefused(f"Could not read '{from_branch}' in {repo}: {r.status_code} {r.text[:200]}")
+    sha = r.json()["object"]["sha"]
+
+    r = requests.post(
+        f"{GITHUB_API}/repos/{repo}/git/refs",
+        headers=_gh_headers(),
+        json={"ref": f"refs/heads/{new_branch}", "sha": sha},
+        timeout=TIMEOUT,
+    )
+    if r.status_code == 422:
+        return f"Branch '{new_branch}' already exists in {repo}."
+    if r.status_code not in (200, 201):
+        raise WriteRefused(f"Branch create failed: {r.status_code} {r.text[:300]}")
+    return f"Created branch '{new_branch}' in {repo} from '{from_branch}' ({sha[:7]})."
+
+
+def tool_github_write_file(
+    repo, path, content, message, branch: str
+):
+    """Create or update a single file on a non-default branch."""
+    _check_repo(repo)
+    _check_branch(branch)
+    if not message.strip():
+        raise WriteRefused("A commit message is required.")
+    if path.startswith("/") or ".." in path:
+        raise WriteRefused(f"Refusing suspicious path '{path}'.")
+    if os.path.basename(path) in (".env", ".env.local", ".env.production"):
+        raise WriteRefused("Refusing to commit an env file.")
+
+    # Existing file? Need its sha to update.
+    existing_sha = None
+    r = requests.get(
+        f"{GITHUB_API}/repos/{repo}/contents/{path}",
+        headers=_gh_headers(),
+        params={"ref": branch},
+        timeout=TIMEOUT,
+    )
+    if r.status_code == 200:
+        existing_sha = r.json().get("sha")
+    elif r.status_code not in (404,):
+        raise WriteRefused(f"Could not check '{path}': {r.status_code} {r.text[:200]}")
+
+    payload = {
+        "message": message,
+        "content": base64.b64encode(content.encode("utf-8")).decode("ascii"),
+        "branch": branch,
+    }
+    if existing_sha:
+        payload["sha"] = existing_sha
+
+    r = requests.put(
+        f"{GITHUB_API}/repos/{repo}/contents/{path}",
+        headers=_gh_headers(),
+        json=payload,
+        timeout=TIMEOUT,
+    )
+    if r.status_code not in (200, 201):
+        raise WriteRefused(f"File write failed: {r.status_code} {r.text[:300]}")
+    commit = r.json().get("commit", {}).get("sha", "")[:7]
+    verb = "Updated" if existing_sha else "Created"
+    return f"{verb} {path} in {repo} on '{branch}' (commit {commit})."
+
+
+def tool_github_open_pr(
+    repo, head, title, body = "", base = "main"
+):
+    _check_repo(repo)
+    _check_branch(head)  # head must not be a protected branch
+    if not title.strip():
+        raise WriteRefused("A PR title is required.")
+
+    r = requests.post(
+        f"{GITHUB_API}/repos/{repo}/pulls",
+        headers=_gh_headers(),
+        json={"title": title, "head": head, "base": base, "body": body, "draft": False},
+        timeout=TIMEOUT,
+    )
+    if r.status_code not in (200, 201):
+        raise WriteRefused(f"PR open failed: {r.status_code} {r.text[:300]}")
+    d = r.json()
+    return f"Opened PR #{d.get('number')} in {repo}: {d.get('html_url')}"
+
+
+# ------------------------------------------------------------------- supabase
+
+
+def _sb_headers():
+    if not (SUPABASE_URL and SUPABASE_WRITE_KEY):
+        raise WriteRefused("SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY not set.")
+    return {
+        "apikey": SUPABASE_WRITE_KEY,
+        "Authorization": f"Bearer {SUPABASE_WRITE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation",
+    }
+
+
+def _check_table(table):
+    t = table.strip().lower()
+    if not t or not t.replace("_", "").isalnum():
+        raise WriteRefused(f"Refusing table name '{table}'.")
+    if t in SUPABASE_FORBIDDEN_TABLES:
+        raise WriteRefused(f"'{table}' is permanently read-only.")
+    if not SUPABASE_WRITE_TABLES:
+        raise WriteRefused("SUPABASE_WRITE_TABLES is empty — no table is writable.")
+    if t not in SUPABASE_WRITE_TABLES:
+        raise WriteRefused(
+            f"'{table}' is not on the write allowlist. Ask Dal to add it, don't route around it."
         )
 
 
-def recent_audit(limit: int = 20):
-    with _conn() as c:
-        rows = c.execute(
-            "SELECT * FROM write_audit ORDER BY id DESC LIMIT ?", (limit,)
-        ).fetchall()
-    return [dict(r) for r in rows]
+def tool_supabase_insert_row(table, values):
+    _check_table(table)
+    if not isinstance(values, dict) or not values:
+        raise WriteRefused("values must be a non-empty object.")
+
+    r = requests.post(
+        f"{SUPABASE_URL}/rest/v1/{table}",
+        headers=_sb_headers(),
+        json=values,
+        timeout=TIMEOUT,
+    )
+    if r.status_code not in (200, 201):
+        raise WriteRefused(f"Insert failed: {r.status_code} {r.text[:300]}")
+    return f"Inserted into {table}:\n{json.dumps(r.json(), indent=2)[:1500]}"
 
 
-def _safe_json(args):
-    """Never let a credential-shaped value reach the log."""
-    redacted = {}
-    for k, v in (args or {}).items():
-        if any(s in k.lower() for s in ("token", "key", "secret", "password", "auth")):
-            redacted[k] = "[redacted]"
-        elif isinstance(v, str) and len(v) > 4000:
-            redacted[k] = v[:4000] + f"... [truncated, {len(v)} chars]"
-        else:
-            redacted[k] = v
-    return json.dumps(redacted, ensure_ascii=False, default=str)
+def tool_supabase_update_row(
+    table, row_id, values, id_column = "id"
+):
+    """Update exactly one row, matched on its primary key."""
+    _check_table(table)
+    if not row_id:
+        raise WriteRefused("row_id is required — no bulk updates.")
+    if not isinstance(values, dict) or not values:
+        raise WriteRefused("values must be a non-empty object.")
+    if id_column in values:
+        raise WriteRefused("Refusing to change a row's primary key.")
+    if not id_column.replace("_", "").isalnum():
+        raise WriteRefused(f"Refusing id_column '{id_column}'.")
 
-
-# ------------------------------------------------------------------------ staging
-
-
-def _expire_stale():
-    now = time.time()
-    with _conn() as c:
-        stale = c.execute(
-            "SELECT token, chat_id, tool_name, args_json FROM pending_writes"
-            " WHERE status='pending' AND expires_at < ?",
-            (now,),
-        ).fetchall()
-        if stale:
-            c.execute(
-                "UPDATE pending_writes SET status='expired'"
-                " WHERE status='pending' AND expires_at < ?",
-                (now,),
-            )
-    for r in stale:
-        log_write(r["chat_id"], r["tool_name"], {}, "expired", r["token"])
-
-
-def stage(chat_id, tool_name, args, summary):
-    """Park a write and return its confirmation token."""
-    _expire_stale()
-    token = secrets.token_hex(2)  # 4 chars, short enough to thumb-type
-    now = time.time()
-    with _conn() as c:
-        c.execute(
-            "INSERT INTO pending_writes"
-            " (token, chat_id, tool_name, args_json, summary, created_at, expires_at)"
-            " VALUES (?,?,?,?,?,?,?)",
-            (
-                token,
-                chat_id,
-                tool_name,
-                json.dumps(args, ensure_ascii=False, default=str),
-                summary,
-                now,
-                now + TTL_SECONDS,
-            ),
+    r = requests.patch(
+        f"{SUPABASE_URL}/rest/v1/{table}",
+        headers=_sb_headers(),
+        params={id_column: f"eq.{row_id}"},
+        json=values,
+        timeout=TIMEOUT,
+    )
+    if r.status_code not in (200, 204):
+        raise WriteRefused(f"Update failed: {r.status_code} {r.text[:300]}")
+    rows = r.json() if r.text.strip() else []
+    if isinstance(rows, list) and len(rows) > 1:
+        return (
+            f"WARNING: {len(rows)} rows matched {id_column}={row_id} in {table}. "
+            "That column is not unique — tell Dal before doing this again."
         )
-    log_write(chat_id, tool_name, args, "staged", token)
-    return token
-
-
-def pending_for(chat_id):
-    _expire_stale()
-    with _conn() as c:
-        rows = c.execute(
-            "SELECT token, tool_name, summary, expires_at FROM pending_writes"
-            " WHERE chat_id=? AND status='pending' ORDER BY created_at",
-            (chat_id,),
-        ).fetchall()
-    return [dict(r) for r in rows]
-
-
-def take_confirmed(chat_id, token):
-    """
-    Claim a staged write for execution.
-    Returns (tool_name, args, error). tool_name is None when error is set.
-    Single-use: the row is marked confirmed before the caller executes it, so a
-    token can never fire twice.
-    """
-    _expire_stale()
-    token = token.strip().lstrip("#").lower()
-    with _conn() as c:
-        row = c.execute(
-            "SELECT * FROM pending_writes WHERE token=?", (token,)
-        ).fetchone()
-        if row is None:
-            return None, {}, f"No pending action `{token}`."
-        if row["chat_id"] != chat_id:
-            log_write(chat_id, row["tool_name"], {}, "blocked", "wrong chat for token")
-            return None, {}, f"No pending action `{token}`."
-        if row["status"] != "pending":
-            return None, {}, f"Action `{token}` is already {row['status']}."
-        c.execute(
-            "UPDATE pending_writes SET status='confirmed' WHERE token=?", (token,)
-        )
-    args = json.loads(row["args_json"])
-    log_write(chat_id, row["tool_name"], args, "confirmed", token)
-    return row["tool_name"], args, ""
-
-
-def cancel(chat_id, token):
-    token = token.strip().lstrip("#").lower()
-    with _conn() as c:
-        row = c.execute(
-            "SELECT * FROM pending_writes WHERE token=? AND chat_id=?", (token, chat_id)
-        ).fetchone()
-        if row is None:
-            return f"No pending action `{token}`."
-        if row["status"] != "pending":
-            return f"Action `{token}` is already {row['status']}."
-        c.execute("UPDATE pending_writes SET status='cancelled' WHERE token=?", (token,))
-    log_write(chat_id, row["tool_name"], {}, "cancelled", token)
-    return f"Cancelled `{token}` — {row['summary']}"
-
-
-def cancel_all(chat_id):
-    items = pending_for(chat_id)
-    for i in items:
-        cancel(chat_id, i["token"])
-    return f"Cancelled {len(items)} pending action(s)." if items else "Nothing pending."
-
-
-# --------------------------------------------------------------------- interception
-
-
-def summarise(tool_name, args):
-    """Human-readable one-liner for the confirmation prompt."""
-    a = args or {}
-    if tool_name == "github_write_file":
-        return f"Write `{a.get('path')}` in **{a.get('repo')}** on branch `{a.get('branch')}`"
-    if tool_name == "github_create_branch":
-        return f"Create branch `{a.get('new_branch')}` in **{a.get('repo')}** from `{a.get('from_branch', 'main')}`"
-    if tool_name == "github_open_pr":
-        return f"Open PR in **{a.get('repo')}**: `{a.get('head')}` → `{a.get('base', 'main')}` — {a.get('title')}"
-    if tool_name == "supabase_insert_row":
-        return f"Insert 1 row into **{a.get('table')}**"
-    if tool_name == "supabase_update_row":
-        return f"Update **{a.get('table')}** row `{a.get('row_id')}` — fields: {', '.join((a.get('values') or {}).keys())}"
-    if tool_name == "lovable_send_message":
-        return f"Send a build message to Lovable project `{a.get('project_id')}` (costs credits)"
-    return f"Run `{tool_name}`"
-
-
-def detail_block(tool_name, args):
-    """The bit Dal actually reads before approving. Show the real payload."""
-    a = args or {}
-    if tool_name == "github_write_file":
-        body = a.get("content", "")
-        preview = body if len(body) <= 1200 else body[:1200] + "\n… [truncated]"
-        return f"commit: {a.get('message')}\n\n```\n{preview}\n```"
-    if tool_name == "github_open_pr":
-        return a.get("body", "") or ""
-    if tool_name in ("supabase_insert_row", "supabase_update_row"):
-        return "```json\n" + json.dumps(a.get("values", {}), indent=2)[:1200] + "\n```"
-    if tool_name == "lovable_send_message":
-        return "```\n" + str(a.get("message", ""))[:1500] + "\n```"
-    return ""
-
-
-def intercept(chat_id, tool_name, arguments_json):
-    """
-    Call this in agent.py BEFORE run_tool(), with the same arguments it gets.
-
-    Returns None  -> not a write tool, carry on and call run_tool as normal.
-    Returns a str -> do NOT execute. Hand the string back as the tool result.
-    """
-    if not is_write_tool(tool_name):
-        return None
-
-    try:
-        args = json.loads(arguments_json or "{}")
-    except json.JSONDecodeError:
-        return f"Tool '{tool_name}' was called with malformed arguments. Nothing staged."
-    if not isinstance(args, dict):
-        return f"Tool '{tool_name}' expects an object of arguments. Nothing staged."
-
-    if chat_id not in ALLOWED_WRITE_CHAT_IDS:
-        log_write(chat_id, tool_name, args, "blocked", "chat not write-authorised")
-        return "Write tools aren't enabled for this chat. Nothing has been changed."
-
-    token = stage(chat_id, tool_name, args, summarise(tool_name, args))
-    lines = ["Confirm this write", "", summarise(tool_name, args)]
-    detail = detail_block(tool_name, args)
-    if detail:
-        lines += ["", detail]
-    lines += [
-        "",
-        f"/confirm {token} to run it - /cancel {token} to bin it",
-        f"Expires in {TTL_SECONDS // 60} min. Nothing has changed yet.",
-    ]
-    if DRY_RUN:
-        lines.insert(1, "(dry-run mode: confirming will log but not execute)")
-    return "\n".join(lines)
-
-
-def execute_confirmed(chat_id, token, runner):
-    """
-    Handler for /confirm. `runner` is tools.run_tool - it takes (name, arguments_json)
-    and always returns a string.
-    """
-    tool_name, args, err = take_confirmed(chat_id, token)
-    if err:
-        return err
-    if DRY_RUN:
-        log_write(chat_id, tool_name, args, "executed", "dry-run, skipped")
-        return f"Dry run - '{tool_name}' was not executed. Nothing changed."
-    try:
-        result = runner(tool_name, json.dumps(args))
-        log_write(chat_id, tool_name, args, "executed", str(result)[:2000])
-        return f"Done - {summarise(tool_name, args)}\n\n{result}"
-    except Exception as exc:  # noqa: BLE001 - a write must never kill the agent
-        log_write(chat_id, tool_name, args, "failed", repr(exc))
-        return f"Failed - {summarise(tool_name, args)}\n\n{exc}\n\nNothing was retried."
-
-
-def pending_summary(chat_id):
-    """Text for /pending."""
-    items = pending_for(chat_id)
-    if not items:
-        return "Nothing waiting for approval."
-    lines = ["Waiting for you:", ""]
-    for item in items:
-        left = max(0, int(item["expires_at"] - time.time()) // 60)
-        lines.append(f"  {item['token']}  {item['summary']}  ({left} min left)")
-    lines += ["", "/confirm <token> or /cancel <token>"]
-    return "\n".join(lines)
-
-
-def audit_summary(limit=15):
-    """Text for /writelog."""
-    rows = recent_audit(limit)
     if not rows:
-        return "No write activity recorded."
-    lines = ["Recent write activity:", ""]
-    for row in rows:
-        when = time.strftime("%d %b %H:%M", time.localtime(row["created_at"]))
-        lines.append(f"  {when}  {row['outcome']:<9} {row['tool_name']}")
-    return "\n".join(lines)
+        return f"No row matched {id_column}={row_id} in {table}. Nothing changed."
+    return f"Updated {table} row {row_id}:\n{json.dumps(rows, indent=2)[:1500]}"
+
+
+# -------------------------------------------------------------------- registry
+
+WRITE_TOOL_FUNCTIONS = {
+    "github_create_branch": tool_github_create_branch,
+    "github_write_file": tool_github_write_file,
+    "github_open_pr": tool_github_open_pr,
+    "supabase_insert_row": tool_supabase_insert_row,
+    "supabase_update_row": tool_supabase_update_row,
+}
+
+READ_TOOL_FUNCTIONS = {}
+
+for _name in WRITE_TOOL_FUNCTIONS:
+    register_write_tool(_name)
+
+
+# Merged into tools.py's TOOL_SCHEMAS / TOOL_FUNCTIONS by three lines there.
+# Lovable tools deliberately absent. Lovable exposes no REST API for project
+# messages - only an MCP server at mcp.lovable.dev, which is OAuth-only and whose
+# OAuth flow is restricted to ChatGPT/Claude/Cursor/VS Code. A Python service
+# cannot connect. To change a Lovable app, write to the GitHub repo it syncs with.
+
+WRITE_TOOL_SCHEMAS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "github_create_branch",
+            "description": "Create a new branch in one of Dal's repos. Requires Dal's confirmation before it runs. Branch names should be brooksy/<short-description>.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "repo": {
+                        "type": "string",
+                        "description": "owner/name"
+                    },
+                    "new_branch": {
+                        "type": "string"
+                    },
+                    "from_branch": {
+                        "type": "string",
+                        "default": "main"
+                    }
+                },
+                "required": [
+                    "repo",
+                    "new_branch"
+                ]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "github_write_file",
+            "description": "Create or update one file on a non-default branch. Read the file first. Never targets main/master/production. Requires Dal's confirmation.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "repo": {
+                        "type": "string",
+                        "description": "owner/name"
+                    },
+                    "path": {
+                        "type": "string"
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Full new file contents"
+                    },
+                    "message": {
+                        "type": "string",
+                        "description": "One-line commit message"
+                    },
+                    "branch": {
+                        "type": "string"
+                    }
+                },
+                "required": [
+                    "repo",
+                    "path",
+                    "content",
+                    "message",
+                    "branch"
+                ]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "github_open_pr",
+            "description": "Open a pull request. Body should cover what changed, why, what was not touched, and what Dal should test. Requires Dal's confirmation.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "repo": {
+                        "type": "string"
+                    },
+                    "head": {
+                        "type": "string",
+                        "description": "Branch with the changes"
+                    },
+                    "title": {
+                        "type": "string"
+                    },
+                    "body": {
+                        "type": "string"
+                    },
+                    "base": {
+                        "type": "string",
+                        "default": "main"
+                    }
+                },
+                "required": [
+                    "repo",
+                    "head",
+                    "title"
+                ]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "supabase_insert_row",
+            "description": "Insert one row into an allowlisted table. Requires Dal's confirmation. There is no delete tool and never will be.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "table": {
+                        "type": "string"
+                    },
+                    "values": {
+                        "type": "object"
+                    }
+                },
+                "required": [
+                    "table",
+                    "values"
+                ]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "supabase_update_row",
+            "description": "Update exactly one row by primary key in an allowlisted table. Query the row first. No bulk updates. Requires Dal's confirmation.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "table": {
+                        "type": "string"
+                    },
+                    "row_id": {
+                        "type": "string"
+                    },
+                    "values": {
+                        "type": "object"
+                    },
+                    "id_column": {
+                        "type": "string",
+                        "default": "id"
+                    }
+                },
+                "required": [
+                    "table",
+                    "row_id",
+                    "values"
+                ]
+            }
+        }
+    }
+]
