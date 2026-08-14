@@ -1,4 +1,4 @@
----
+—---
 name: change-control
 description: Rules for any write action - repos, database, deployed apps. Load before the first write of a session.
 ---
