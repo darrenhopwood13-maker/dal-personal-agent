@@ -30,9 +30,14 @@ DRY_RUN = os.getenv("WRITE_DRY_RUN", "0") == "1"
 
 # Tighter than ALLOWED_CHAT_IDS on purpose: reading is one trust level, writing another.
 _raw_write_ids = os.getenv("ALLOWED_WRITE_CHAT_IDS", "").strip()
-ALLOWED_WRITE_CHAT_IDS = {
-    int(x) for x in _raw_write_ids.replace(" ", "").split(",") if x
-}
+ALLOWED_WRITE_CHAT_IDS = set()
+for _entry in _raw_write_ids.replace(" ", "").split(","):
+    if not _entry:
+        continue
+    try:
+        ALLOWED_WRITE_CHAT_IDS.add(int(_entry))
+    except ValueError:
+        print(f"writes: ignoring malformed ALLOWED_WRITE_CHAT_IDS entry {_entry!r}")
 
 # Populated by tools_write.py at import time.
 WRITE_TOOLS = set()
@@ -292,7 +297,7 @@ def intercept(chat_id, tool_name, arguments_json):
     if not isinstance(args, dict):
         return f"Tool '{tool_name}' expects an object of arguments. Nothing staged."
 
-    if ALLOWED_WRITE_CHAT_IDS and chat_id not in ALLOWED_WRITE_CHAT_IDS:
+    if chat_id not in ALLOWED_WRITE_CHAT_IDS:
         log_write(chat_id, tool_name, args, "blocked", "chat not write-authorised")
         return "Write tools aren't enabled for this chat. Nothing has been changed."
 
