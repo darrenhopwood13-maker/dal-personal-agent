@@ -949,3 +949,9 @@ def run_tool(name, arguments_json):
         return f"Tool '{name}' was called with the wrong arguments: {exc}"
     except Exception as exc:  # noqa: BLE001 - a tool must never kill the agent
         return f"Tool '{name}' failed: {exc}"
+
+
+from tools_write import WRITE_TOOL_SCHEMAS, WRITE_TOOL_FUNCTIONS, READ_TOOL_FUNCTIONS
+TOOL_SCHEMAS.extend(WRITE_TOOL_SCHEMAS)
+TOOL_FUNCTIONS.update(WRITE_TOOL_FUNCTIONS)
+TOOL_FUNCTIONS.update(READ_TOOL_FUNCTIONS)
