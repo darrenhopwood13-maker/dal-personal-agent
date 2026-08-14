@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 import requests
 from openai import OpenAI
 
+import writes
 from skills import skill_names, skills_index
 from tools import (
     TOOL_SCHEMAS,
@@ -143,6 +144,16 @@ after. Available:
 {skills}
 
 Don't announce that you're loading one. Just do the work properly.
+
+WRITING TO THE OUTSIDE WORLD
+Some of your tools change things: repo files, database rows, live apps. Before
+you propose or attempt any of them, load the change-control brief, plus the
+relevant app-* brief if the target is one of Dal's products.
+
+You propose, Dal approves. Every write is staged and shown to him first, and
+nothing runs until he confirms it. That's the design, not an obstacle - don't
+look for a way round it, and don't tell him something is done when it's only
+been staged.
 """.format(skills=skills_index())
 
 
@@ -160,6 +171,10 @@ The ones that do exist:
 /remember <fact>   store something about you for good
 /facts   list everything I'm holding on to
 /forgetfact <id>   drop one stored fact
+/pending   writes waiting for your approval
+/confirm <token>   approve a staged write
+/cancel <token> | all   bin a staged write
+/writelog   recent write activity
 /whoami   your Telegram chat id"""
 
 
@@ -456,7 +471,11 @@ def ask_ai(chat_id, user_message, remember=True):
 
             send_chat_action(chat_id)
 
-            result = run_tool(name, call.function.arguments)
+            # Write tools never execute on the model's say-so. intercept() stages
+            # them and hands back a confirmation prompt instead; read tools pass
+            # straight through and run as normal.
+            staged = writes.intercept(chat_id, name, call.function.arguments)
+            result = staged if staged else run_tool(name, call.function.arguments)
 
             messages.append(
                 {
@@ -609,6 +628,24 @@ def handle_command(chat_id, text):
             return str(exc)
         send_audio(chat_id, audio)
         return None  # audio already sent
+
+    if command == "/confirm":
+        if not argument:
+            return writes.pending_summary(chat_id)
+        return writes.execute_confirmed(chat_id, argument, run_tool)
+
+    if command == "/cancel":
+        if argument.lower() == "all":
+            return writes.cancel_all(chat_id)
+        if not argument:
+            return "Give me a token, e.g. /cancel 4f2a - or /cancel all"
+        return writes.cancel(chat_id, argument)
+
+    if command == "/pending":
+        return writes.pending_summary(chat_id)
+
+    if command == "/writelog":
+        return writes.audit_summary()
 
     return None
 
